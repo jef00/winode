@@ -22,6 +22,7 @@
 #AUTOLOGIN=
 #W11_ISO_URL=
 #W11_IMAGE_INDEX=
+VIRTIO_ISO_URL='https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso'
 W2K22_ISO_URL='https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US'
 
 # STAGE changes dynamically as install progresses
@@ -354,6 +355,26 @@ inspect_iso() {
   umount $mnt
 }
 
+# Copy VirtIO drivers from virtio-win.iso into $WinPEDriver$ on the install media.
+# Windows Setup loads every driver in that folder in WinPE (so it can see the
+# virtio-scsi disk) and adds them to the installed system. No WIM editing needed.
+add_winpe_drivers() {
+  local media="$1" vmnt=/root/virtio-mnt osdir=w11 d n=0
+  [ "$INSTALL_WINDOWS_VERSION" == "2k22" ] && osdir=2k22
+  mkdir -p $vmnt
+  mount -o loop,ro /virtio-win.iso $vmnt || { echo "Error: cannot mount virtio-win.iso"; return 1; }
+  for d in vioscsi viostor NetKVM Balloon vioserial; do
+    if [ -d "$vmnt/$d/$osdir/amd64" ]; then
+      mkdir -p "$media/\$WinPEDriver\$/$d"
+      cp -r "$vmnt/$d/$osdir/amd64/." "$media/\$WinPEDriver\$/$d/"
+      echo "  added $d ($osdir/amd64)"
+      n=$((n + 1))
+    fi
+  done
+  umount $vmnt
+  [ $n -gt 0 ]
+}
+
 stage3() {
 
   export LINODE_ID=`dmidecode -t1 | grep Serial | awk '{print $3}'`
@@ -434,17 +455,24 @@ stage3() {
     sed -i "s/IMAGE_INDEX_PLACEHOLDER/$IMAGE_INDEX/" /root/autounattend.xml
   fi
 
-  if ! [ -f windows_virtio.iso ]; then
-    if [ "$ISO_HAS_VIRTIO" == "true" ]; then
-      echo "ISO is pre-injected with VirtIO drivers, skipping distrobuilder"
-      ln windows-amd64.iso windows_virtio.iso
-    else
-      # v3.2 is required for Windows 11 24H2 driver injection to work --edge gets us this
-      if ! [ -f /snap/bin/distrobuilder ]; then
-        snap install distrobuilder --classic --edge
-      fi
-      distrobuilder repack-windows windows-amd64.iso windows_virtio.iso --windows-version=$INSTALL_WINDOWS_VERSION
+  # Drivers missing from the ISO are supplied through $WinPEDriver$ on the
+  # install partition (distrobuilder's snap is no longer available).
+  NEED_WINPE_DRIVERS=false
+  if [ "$ISO_HAS_VIRTIO" == "true" ]; then
+    echo "ISO is pre-injected with VirtIO drivers"
+  else
+    NEED_WINPE_DRIVERS=true
+    echo "VirtIO drivers will be added via \$WinPEDriver\$"
+    if ! [ -s /virtio-win.iso ]; then
+      wget -q -O /virtio-win.iso "$VIRTIO_ISO_URL"
     fi
+    if ! [ -s /virtio-win.iso ]; then
+      echo "Error: could not download virtio-win.iso"
+      exit 1
+    fi
+  fi
+  if ! [ -f windows_virtio.iso ]; then
+    ln windows-amd64.iso windows_virtio.iso
   fi
   if ! [ -f windows_virtio.iso ]; then
     echo "Error: No valid VirtIO ISO found."
@@ -487,6 +515,14 @@ stage3() {
   # and leaves the install media on partition 1 alone.
   find /mnt -maxdepth 1 -iname 'autounattend.xml' -delete
   cp /root/autounattend.xml /mnt/
+  if [ "$NEED_WINPE_DRIVERS" == "true" ]; then
+    echo "Adding VirtIO drivers to \$WinPEDriver\$..."
+    if ! add_winpe_drivers /mnt; then
+      echo "Error: no VirtIO drivers copied, Setup would not find the disk"
+      umount /mnt
+      exit 1
+    fi
+  fi
   umount /mnt
 
   # ===== kexec-based cleanup =====

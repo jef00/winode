@@ -47,7 +47,7 @@ Choose `w11` and put a direct download link to your own ISO in `W11_ISO_URL`.
 In stage 3 the script opens the ISO and checks for VirtIO drivers:
 
 - If `vioscsi` is in the Setup image of `boot.wim` and both `vioscsi` and `netkvm` are in the chosen install image, the ISO is used as it is. The distrobuilder repack is skipped.
-- If any of them is missing, it falls back to the distrobuilder injection as before.
+- If any of them is missing, the script downloads the official `virtio-win.iso` and copies vioscsi, viostor, NetKVM, Balloon and vioserial into a `$WinPEDriver$` folder on the install partition. Windows Setup loads those drivers automatically and adds them to the installed system. distrobuilder is no longer used, because its snap is gone.
 
 `W11_IMAGE_INDEX` chooses the edition Setup applies. `auto` uses the only image, or `Windows 11 Pro` on a multi-edition ISO. Set a number to force a specific index.
 Any `autounattend.xml` on the ISO is replaced by the script's own answer file, which installs to partition 2 and leaves the installer on partition 1 alone.
