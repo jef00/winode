@@ -40,3 +40,15 @@ By default installations are started without a product key and will default to e
 ![Screenshot](winode-vlan.png)
 
 ![Screenshot](winode-win11.png)
+
+## Custom / pre-injected ISOs (e.g. MicroWin)
+
+Choose `w11` and put a direct download link to your own ISO in `W11_ISO_URL`.
+In stage 3 the script opens the ISO and checks for VirtIO drivers:
+
+- If `vioscsi` is in the Setup image of `boot.wim` and both `vioscsi` and `netkvm` are in the chosen install image, the ISO is used as it is. The distrobuilder repack is skipped.
+- If any of them is missing, it falls back to the distrobuilder injection as before.
+
+`W11_IMAGE_INDEX` chooses the edition Setup applies. `auto` uses the only image, or `Windows 11 Pro` on a multi-edition ISO. Set a number to force a specific index.
+Any `autounattend.xml` on the ISO is replaced by the script's own answer file, which installs to partition 2 and leaves the installer on partition 1 alone.
+Home editions have no Remote Desktop host, so use Pro or higher.

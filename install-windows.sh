@@ -12,7 +12,8 @@
 #<UDF name="WINDOWS_PASSWORD" Label="Administrator Password for Windows" example="Password" />
 #<UDF name="INSTALL_WINDOWS_VERSION" Label="Windows Version" oneOf="w11,2k22" default="2k22"/>
 #<UDF name="AUTOLOGIN" Label="Auto Login to Windows" oneOf="true,false" default="true"/>
-#<UDF name="W11_ISO_URL" Label="Windows 11 ISO URL (Not Required For Windows Server) - Get Fresh URL From https://www.microsoft.com/en-us/software-download/windows11" default="NOURL"/>
+#<UDF name="W11_ISO_URL" Label="Windows 11 ISO URL (Not Required For Windows Server) - Get Fresh URL From https://www.microsoft.com/en-us/software-download/windows11 or a direct link to your own (e.g. MicroWin) ISO" default="NOURL"/>
+#<UDF name="W11_IMAGE_INDEX" Label="Windows 11 install image index (auto = only image, or the 'Windows 11 Pro' edition)" default="auto"/>
 
 # Replaced with values from StackScript UDF
 #TOKEN=
@@ -20,6 +21,7 @@
 #INSTALL_WINDOWS_VERSION=
 #AUTOLOGIN=
 #W11_ISO_URL=
+#W11_IMAGE_INDEX=
 W2K22_ISO_URL='https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US'
 
 # STAGE changes dynamically as install progresses
@@ -31,6 +33,7 @@ if [ $STAGE == 1 ]; then
   sed -i "s/^#INSTALL_WINDOWS_VERSION=/INSTALL_WINDOWS_VERSION=$INSTALL_WINDOWS_VERSION/" /root/StackScript
   sed -i "s/^#AUTOLOGIN=/AUTOLOGIN=$AUTOLOGIN/" /root/StackScript
   sed -i "s/^#W11_ISO_URL=/W11_ISO_URL=\"$(echo $W11_ISO_URL | sed -e 's/\\/\\\\/g; s/\//\\\//g; s/&/\\\&/g')\"/" /root/StackScript
+  sed -i "s/^#W11_IMAGE_INDEX=/W11_IMAGE_INDEX=${W11_IMAGE_INDEX:-auto}/" /root/StackScript
 fi
 
 stage1() {
@@ -267,6 +270,90 @@ stage2() {
   fi
 }
 
+# Path of the install image (install.wim or install.esd) under a mounted ISO
+install_image_path() {
+  if [ -f "$1/sources/install.wim" ]; then
+    echo "$1/sources/install.wim"
+  elif [ -f "$1/sources/install.esd" ]; then
+    echo "$1/sources/install.esd"
+  fi
+}
+
+wim_image_count() {
+  wimlib-imagex info "$1" | awk -F: '/^Image Count/ {gsub(/ /, "", $2); print $2; exit}'
+}
+
+wim_image_name() {
+  wimlib-imagex info "$1" "$2" | awk -F': *' '/^Name:/ {print $2; exit}'
+}
+
+# True if image $2 of WIM $1 contains the given driver (vioscsi, netkvm, ...)
+wim_has_driver() {
+  wimlib-imagex dir "$1" "$2" --path=/Windows/System32/DriverStore/FileRepository 2>/dev/null | grep -qiE "/$3\.(inf|sys)$" && return 0
+  wimlib-imagex dir "$1" "$2" --path=/Windows/System32/drivers 2>/dev/null | grep -qiE "/$3\.sys$"
+}
+
+# Pick which install image Setup should apply.
+# W11_IMAGE_INDEX=<n> forces it; "auto" uses the only image (MicroWin) or "Windows 11 Pro".
+resolve_image_index() {
+  if [ -n "$W11_IMAGE_INDEX" ] && [ "$W11_IMAGE_INDEX" != "auto" ]; then
+    echo "$W11_IMAGE_INDEX"
+    return
+  fi
+  local count idx
+  count=$(wim_image_count "$1")
+  if [ "${count:-1}" -le 1 ]; then
+    echo 1
+    return
+  fi
+  idx=$(wimlib-imagex info "$1" | awk '/^Index:/ {i=$2} /^Name:/ && / Pro$/ {print i; exit}')
+  echo "${idx:-1}"
+}
+
+# Inspects the downloaded ISO: sets IMAGE_INDEX and ISO_HAS_VIRTIO (true/false).
+# The ISO counts as pre-injected (e.g. MicroWin with VirtIO drivers) when the
+# Setup image in boot.wim has vioscsi and the install image has vioscsi + netkvm.
+inspect_iso() {
+  local iso="$1" mnt=/mnt/iso-check bootwim inst boot_idx name
+  ISO_HAS_VIRTIO=false
+  IMAGE_INDEX=1
+  mkdir -p $mnt
+  if ! mount -o loop,ro "$iso" $mnt; then
+    echo "Warning: could not mount $iso for inspection"
+    return
+  fi
+  bootwim="$mnt/sources/boot.wim"
+  inst=$(install_image_path $mnt)
+  if [ -z "$inst" ] || ! [ -f "$bootwim" ]; then
+    echo "Warning: boot.wim or install image not found on ISO"
+    umount $mnt
+    return
+  fi
+
+  wimlib-imagex info "$inst" | grep -E '^(Index|Name):'
+  IMAGE_INDEX=$(resolve_image_index "$inst")
+  name=$(wim_image_name "$inst" "$IMAGE_INDEX")
+  echo "Selected install image index $IMAGE_INDEX: $name"
+  if [ -z "$name" ]; then
+    echo "Error: install image index $IMAGE_INDEX does not exist in $(basename $inst)"
+    umount $mnt
+    exit 1
+  fi
+  if echo "$name" | grep -qi "home"; then
+    echo "Warning: '$name' has no Remote Desktop host - you will only have Glish/Lish access"
+  fi
+
+  # Windows Setup runs from the last image in boot.wim (normally index 2)
+  boot_idx=$(wim_image_count "$bootwim")
+  local ok=true
+  wim_has_driver "$bootwim" "$boot_idx" vioscsi || { echo "boot.wim index $boot_idx: vioscsi missing"; ok=false; }
+  wim_has_driver "$inst" "$IMAGE_INDEX" vioscsi || { echo "install image $IMAGE_INDEX: vioscsi missing"; ok=false; }
+  wim_has_driver "$inst" "$IMAGE_INDEX" netkvm  || { echo "install image $IMAGE_INDEX: netkvm missing"; ok=false; }
+  ISO_HAS_VIRTIO=$ok
+  echo "ISO already contains VirtIO drivers: $ISO_HAS_VIRTIO"
+  umount $mnt
+}
+
 stage3() {
 
   export LINODE_ID=`dmidecode -t1 | grep Serial | awk '{print $3}'`
@@ -325,11 +412,6 @@ stage3() {
     https://api.linode.com/v4/volumes | jq -r '.data[0].id')
   echo "Volume ID: $VOLUME_ID"
 
-  # v3.2 is required for Windows 11 24H2 driver injection to work --edge gets us this
-  if ! [ -f /snap/bin/distrobuilder ]; then
-    snap install distrobuilder --classic --edge
-  fi
-
   if ! [ -f woeusb.sh ]; then
     wget -O woeusb.sh https://github.com/WoeUSB/WoeUSB/releases/download/v5.2.4/woeusb-5.2.4.bash
     chmod +x woeusb.sh
@@ -347,8 +429,22 @@ stage3() {
     exit
   fi
 
+  inspect_iso windows-amd64.iso
+  if [ $INSTALL_WINDOWS_VERSION == "w11" ]; then
+    sed -i "s/IMAGE_INDEX_PLACEHOLDER/$IMAGE_INDEX/" /root/autounattend.xml
+  fi
+
   if ! [ -f windows_virtio.iso ]; then
-    distrobuilder repack-windows windows-amd64.iso windows_virtio.iso --windows-version=$INSTALL_WINDOWS_VERSION
+    if [ "$ISO_HAS_VIRTIO" == "true" ]; then
+      echo "ISO is pre-injected with VirtIO drivers, skipping distrobuilder"
+      ln windows-amd64.iso windows_virtio.iso
+    else
+      # v3.2 is required for Windows 11 24H2 driver injection to work --edge gets us this
+      if ! [ -f /snap/bin/distrobuilder ]; then
+        snap install distrobuilder --classic --edge
+      fi
+      distrobuilder repack-windows windows-amd64.iso windows_virtio.iso --windows-version=$INSTALL_WINDOWS_VERSION
+    fi
   fi
   if ! [ -f windows_virtio.iso ]; then
     echo "Error: No valid VirtIO ISO found."
@@ -386,6 +482,10 @@ stage3() {
   # Copy autounattend.xml to the installation media partition
   echo "Copying autounattend.xml to installation media..."
   mount /dev/sdb1 /mnt
+  # ntfs-3g is case sensitive: drop any answer file shipped on the ISO (MicroWin
+  # adds its own) so ours is the only one Setup finds. Ours installs to partition 2
+  # and leaves the install media on partition 1 alone.
+  find /mnt -maxdepth 1 -iname 'autounattend.xml' -delete
   cp /root/autounattend.xml /mnt/
   umount /mnt
 
@@ -896,8 +996,8 @@ cat > /root/autounattend.xml<<EOF
                 <OSImage>
                     <InstallFrom>
                         <MetaData wcm:action="add">
-                            <Key>/IMAGE/NAME</Key>
-                            <Value>Windows 10 Pro</Value>
+                            <Key>/IMAGE/INDEX</Key>
+                            <Value>IMAGE_INDEX_PLACEHOLDER</Value>
                         </MetaData>
                     </InstallFrom>
                     <InstallTo>
