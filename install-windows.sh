@@ -320,15 +320,20 @@ inspect_iso() {
   IMAGE_INDEX=1
   mkdir -p $mnt
   if ! mount -o loop,ro "$iso" $mnt; then
-    echo "Warning: could not mount $iso for inspection"
-    return
+    echo "Error: $iso is not a readable ISO (download failed or wrong URL?)"
+    exit 1
   fi
   bootwim="$mnt/sources/boot.wim"
   inst=$(install_image_path $mnt)
   if [ -z "$inst" ] || ! [ -f "$bootwim" ]; then
-    echo "Warning: boot.wim or install image not found on ISO"
+    echo "Error: sources/boot.wim or sources/install.wim/esd not found on ISO"
     umount $mnt
-    return
+    exit 1
+  fi
+  if [ -z "$(find $mnt -maxdepth 1 -iname bootmgr -print -quit)" ]; then
+    echo "Error: bootmgr missing from ISO root - it cannot boot in Linode's legacy BIOS mode"
+    umount $mnt
+    exit 1
   fi
 
   wimlib-imagex info "$inst" | grep -E '^(Index|Name):'
@@ -442,12 +447,16 @@ stage3() {
       wget -q -O windows-amd64.iso $W2K22_ISO_URL
     fi
     if [ $INSTALL_WINDOWS_VERSION == "w11" ]; then
-      wget -q -O windows-amd64.iso $W11_ISO_URL
+      echo "Downloading Windows ISO from $W11_ISO_URL ..."
+      wget -q --tries=5 -O windows-amd64.iso "$W11_ISO_URL"
     fi
   fi
-  if ! [ -f windows-amd64.iso ]; then
-    echo "Error: No valid ISO found."
-    exit
+  ISO_SIZE=$(stat -c %s windows-amd64.iso 2>/dev/null || echo 0)
+  echo "ISO size: $ISO_SIZE bytes"
+  if [ "$ISO_SIZE" -lt 1000000000 ]; then
+    echo "Error: ISO download failed or is incomplete (< 1 GB). Check W11_ISO_URL / your tunnel."
+    rm -f windows-amd64.iso
+    exit 1
   fi
 
   inspect_iso windows-amd64.iso
@@ -505,11 +514,24 @@ stage3() {
   # Use WoeUSB in partition mode to copy installation media to partition 1 only
   # This leaves partition 2 empty for Windows installation
   echo "Copying Windows installation media to /dev/sdb1 with WoeUSB..."
-  ./woeusb.sh --partition windows_virtio.iso /dev/sdb1
+  if ! ./woeusb.sh --partition windows_virtio.iso /dev/sdb1; then
+    echo "Error: WoeUSB failed, not continuing (temp volume and logs are kept)"
+    exit 1
+  fi
 
   # Copy autounattend.xml to the installation media partition
   echo "Copying autounattend.xml to installation media..."
-  mount /dev/sdb1 /mnt
+  if ! mount /dev/sdb1 /mnt; then
+    echo "Error: cannot mount /dev/sdb1"
+    exit 1
+  fi
+  for f in bootmgr boot/bcd sources/boot.wim; do
+    if [ -z "$(find /mnt -maxdepth 2 -ipath "/mnt/$f" -print -quit)" ]; then
+      echo "Error: install media incomplete, /dev/sdb1 is missing $f - not continuing"
+      umount /mnt
+      exit 1
+    fi
+  done
   # ntfs-3g is case sensitive: drop any answer file shipped on the ISO (MicroWin
   # adds its own) so ours is the only one Setup finds. Ours installs to partition 2
   # and leaves the install media on partition 1 alone.
