@@ -406,6 +406,50 @@ wait_for_upload() {
   mv /root/upload.iso windows-amd64.iso
 }
 
+# WinPE cannot read $WinPEDriver$ on the virtio disk before it has a virtio
+# storage driver, so load the drivers from inside boot.wim first:
+# add them as X:\virtio plus a load.cmd that runs drvload on each .inf and
+# then starts the original Setup command, and point the Setup image's
+# HKLM\SYSTEM\Setup\CmdLine at load.cmd.
+patch_bootwim() {
+  local media="$1" wim idx tmp=/root/bootwim-work orig d
+  export WIMLIB_IMAGEX_IGNORE_CASE=1
+  wim=$(find "$media/sources" -maxdepth 1 -iname boot.wim -print -quit)
+  [ -n "$wim" ] || { echo "Error: boot.wim not found on install media"; return 1; }
+  idx=$(wim_image_count "$wim")
+  rm -rf $tmp && mkdir -p $tmp/virtio
+  for d in vioscsi viostor NetKVM; do
+    if [ -d "$media/\$WinPEDriver\$/$d" ]; then
+      cp -r "$media/\$WinPEDriver\$/$d" $tmp/virtio/
+    fi
+  done
+  [ -d $tmp/virtio/vioscsi ] || { echo "Error: vioscsi driver not available for boot.wim"; return 1; }
+
+  wimextract "$wim" $idx /Windows/System32/config/SYSTEM --dest-dir=$tmp --no-acls --no-attributes >/dev/null \
+    || { echo "Error: cannot extract SYSTEM hive from boot.wim index $idx"; return 1; }
+  orig=$(hivexget $tmp/SYSTEM '\Setup' CmdLine 2>/dev/null | tr -d '\r')
+  [ -n "$orig" ] || orig='X:\sources\setup.exe'
+  echo "boot.wim index $idx: original Setup CmdLine: $orig"
+
+  {
+    echo '@echo off'
+    echo 'echo Loading VirtIO drivers...'
+    echo 'for /r X:\virtio %%i in (*.inf) do drvload "%%i"'
+    echo "$orig"
+  } | sed 's/$/\r/' > $tmp/virtio/load.cmd
+
+  printf 'Windows Registry Editor Version 5.00\n\n[HKEY_LOCAL_MACHINE\\SYSTEM\\Setup]\n"CmdLine"="cmd.exe /c X:\\\\virtio\\\\load.cmd"\n' > $tmp/cmdline.reg
+  hivexregedit --merge --prefix 'HKEY_LOCAL_MACHINE\SYSTEM' $tmp/SYSTEM $tmp/cmdline.reg \
+    || { echo "Error: hive edit failed"; return 1; }
+  echo "New Setup CmdLine: $(hivexget $tmp/SYSTEM '\Setup' CmdLine)"
+
+  wimupdate "$wim" $idx --command="add $tmp/SYSTEM /Windows/System32/config/SYSTEM" >/dev/null \
+    && wimupdate "$wim" $idx --command="add $tmp/virtio /virtio" >/dev/null \
+    || { echo "Error: wimupdate failed"; return 1; }
+  echo "boot.wim patched: VirtIO drivers load before Setup starts"
+  rm -rf $tmp
+}
+
 stage3() {
 
   export LINODE_ID=`dmidecode -t1 | grep Serial | awk '{print $3}'`
@@ -419,12 +463,13 @@ stage3() {
   if ! [ -f /usr/bin/wimmount ]; then PACKAGES_NEEDED=true; fi
   if ! command -v kexec >/dev/null; then PACKAGES_NEEDED=true; fi
   if ! [ -f /usr/bin/cpio ]; then PACKAGES_NEEDED=true; fi
+  if ! command -v hivexget >/dev/null || ! command -v hivexregedit >/dev/null; then PACKAGES_NEEDED=true; fi
 
   if [ "$PACKAGES_NEEDED" = true ]; then
     echo "Installing required packages..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -yq wimtools genisoimage libwin-hivex-perl ntfs-3g kexec-tools cpio
+    apt-get install -yq wimtools genisoimage libwin-hivex-perl ntfs-3g kexec-tools cpio libhivex-bin
   fi
 
   RAW_DISK_ID=`curl -sH "Authorization: Bearer $TOKEN" \
@@ -569,6 +614,11 @@ stage3() {
     echo "Adding VirtIO drivers to \$WinPEDriver\$..."
     if ! add_winpe_drivers /mnt; then
       echo "Error: no VirtIO drivers copied, Setup would not find the disk"
+      umount /mnt
+      exit 1
+    fi
+    echo "Patching boot.wim so Setup can see the virtio disk..."
+    if ! patch_bootwim /mnt; then
       umount /mnt
       exit 1
     fi
