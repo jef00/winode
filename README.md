@@ -52,3 +52,12 @@ In stage 3 the script opens the ISO and checks for VirtIO drivers:
 `W11_IMAGE_INDEX` chooses the edition Setup applies. `auto` uses the only image, or `Windows 11 Pro` on a multi-edition ISO. Set a number to force a specific index.
 Any `autounattend.xml` on the ISO is replaced by the script's own answer file, which installs to partition 2 and leaves the installer on partition 1 alone.
 Home editions have no Remote Desktop host, so use Pro or higher.
+
+### Uploading the ISO instead of hosting it
+
+Set `W11_ISO_URL` to `UPLOAD`. In stage 3 the script waits and prints the commands to run, in Lish or with `journalctl -u rc-local -f`:
+
+    scp MicroWin.iso root@<linode-ip>:/root/upload.iso
+    ssh root@<linode-ip> touch /root/iso-ready
+
+The script continues once `/root/iso-ready` exists, so it never starts on a partly uploaded file.

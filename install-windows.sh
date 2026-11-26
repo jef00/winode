@@ -12,7 +12,7 @@
 #<UDF name="WINDOWS_PASSWORD" Label="Administrator Password for Windows" example="Password" />
 #<UDF name="INSTALL_WINDOWS_VERSION" Label="Windows Version" oneOf="w11,2k22" default="2k22"/>
 #<UDF name="AUTOLOGIN" Label="Auto Login to Windows" oneOf="true,false" default="true"/>
-#<UDF name="W11_ISO_URL" Label="Windows 11 ISO URL (Not Required For Windows Server) - Get Fresh URL From https://www.microsoft.com/en-us/software-download/windows11 or a direct link to your own (e.g. MicroWin) ISO" default="NOURL"/>
+#<UDF name="W11_ISO_URL" Label="Windows 11 ISO URL (Not Required For Windows Server) - Get Fresh URL From https://www.microsoft.com/en-us/software-download/windows11 or a direct link to your own (e.g. MicroWin) ISO, or UPLOAD to scp it to the Linode during stage 3" default="NOURL"/>
 #<UDF name="W11_IMAGE_INDEX" Label="Windows 11 install image index (auto = only image, or the 'Windows 11 Pro' edition)" default="auto"/>
 
 # Replaced with values from StackScript UDF
@@ -380,6 +380,32 @@ add_winpe_drivers() {
   [ $n -gt 0 ]
 }
 
+# W11_ISO_URL=UPLOAD: wait until the ISO has been copied to /root/upload.iso
+# and /root/iso-ready exists (created after the upload has finished).
+wait_for_upload() {
+  local ip n=0
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="src") print $(i+1)}')
+  [ -z "$ip" ] && ip="<linode-ip>"
+  rm -f /root/iso-ready
+  while ! [ -f /root/iso-ready ]; do
+    if [ $((n % 12)) -eq 0 ]; then
+      echo "=================================================================="
+      echo "Waiting for ISO upload. From your PC run:"
+      echo "  scp YOUR.iso root@$ip:/root/upload.iso"
+      echo "  ssh root@$ip touch /root/iso-ready"
+      echo "=================================================================="
+    fi
+    n=$((n + 1))
+    sleep 5
+  done
+  if ! [ -f /root/upload.iso ]; then
+    echo "Error: /root/iso-ready exists but /root/upload.iso is missing"
+    exit 1
+  fi
+  echo "Upload received ($(stat -c %s /root/upload.iso) bytes)"
+  mv /root/upload.iso windows-amd64.iso
+}
+
 stage3() {
 
   export LINODE_ID=`dmidecode -t1 | grep Serial | awk '{print $3}'`
@@ -446,7 +472,9 @@ stage3() {
     if [ $INSTALL_WINDOWS_VERSION == "2k22" ]; then
       wget -q -O windows-amd64.iso $W2K22_ISO_URL
     fi
-    if [ $INSTALL_WINDOWS_VERSION == "w11" ]; then
+    if [ $INSTALL_WINDOWS_VERSION == "w11" ] && [ "${W11_ISO_URL^^}" == "UPLOAD" ]; then
+      wait_for_upload
+    elif [ $INSTALL_WINDOWS_VERSION == "w11" ]; then
       echo "Downloading Windows ISO from $W11_ISO_URL ..."
       wget -q --tries=5 -O windows-amd64.iso "$W11_ISO_URL"
     fi
